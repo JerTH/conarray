@@ -4,11 +4,17 @@
 mod swmr;
 
 use std::ptr;
+use std::thread;
 use std::sync::{ Arc };
 use std::sync::atomic::{ AtomicPtr, AtomicI64, Ordering };
 use std::ops::{ Deref, DerefMut, Mul };
 use swmr::{ Ref, RefMut, SwmrCell };
 
+/// A contiguous, heap allocated, fixed sized, concurrent array which supports a single writer and multiple readers in lock-free mode,
+/// and multiple writers which share a single lock. Reads are always wait-free
+/// 
+/// # Reading threads vs. Writing threads
+/// ...
 #[derive(Debug)]
 pub struct ConcurrentArray<T> {
     inner: Arc<SwmrCell<Inner<T>>>,
@@ -16,14 +22,56 @@ pub struct ConcurrentArray<T> {
 }
 
 impl<T> ConcurrentArray<T> {
+    /// Returns a `ReadGuard` which provides read access over the `ConcurrentArray`
+    /// 
+    /// Creating a read guard is guaranteed to be wait-free. Any attempts by writing threads to commit new writes to
+    /// the `ConcurrentArray` will block as long as any `ReadGuards` that existed before the call to commit are not dropped.
+    /// For this reason `ReadGuards` should be dropped as soon as they are no longer necessary, otherwise it is possible to
+    /// unnecessarily stall writing threads
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use conarray::ConcurrentArray;
+    /// 
+    /// let array: ConcurrentArray<i32> = ConcurrentArray::new(10);
+    /// let guard = array.read();
+    /// 
+    /// guard.iter().for_each(|item| assert_eq!(*item, i32::default()));
+    /// ```
     pub fn read(&self) -> ReadGuard<T> {
         ReadGuard::from(self)
     }
     
+    /// Locks this `ConcurrentArray` with single writer write access, blocking the current thread until it can be acquired
+    /// 
+    /// This function will not return while any other thread is performing any type of write operation on this `ConcurrentArray`,
+    /// this includes any thread which calls any function which requires *mutable* access to the `ConcurrentArray`.
+    /// 
+    /// # Note
+    /// 
+    /// Writes made in a writing thread through a `WriteGuard` are *not* immediately visible to reading threads. Instead the
+    /// written state is considered pending until a call to `commit` is made. These writes are only made visible *after* any
+    /// thread calls `commit` on the `ConcurrentArray`. Pending writes can be destroyed at any time and by any thread by calling `cancel`
+    /// on the `ConcucrentArray`
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use conarray::ConcurrentArray;
+    /// 
+    /// let mut array: ConcurrentArray<i32> = ConcurrentArray::new(10);
+    /// let mut guard = array.write();
+    /// 
+    /// guard.iter_mut().for_each(|item| assert_eq!(*item, i32::default()));
+    /// ```
     pub fn write(&mut self) -> WriteGuard<T> {
         WriteGuard::from(self)
     }
     
+    /// Commits a set of pending writes, atomically making them visible to any *new* read operation
+    /// 
+    /// Any threads which were already reading during a call to `commit` will continue to see the old data as if it were 
     pub fn commit(&mut self) {
         let mut inner: RefMut<Inner<T>> = unsafe { self.inner.borrow_mut() };
         
@@ -43,6 +91,16 @@ impl<T> ConcurrentArray<T> {
 }
 
 impl<T: Default + Clone> ConcurrentArray<T> {
+    /// Creates an empty `ConcurrentArray` of size `size`
+    /// 
+    /// The array is immediately allocated on the heap and filled with `T::Default`
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use conarray::ConcurrentArray;
+    /// let mut array: ConcurrentArray<i32> = ConcurrentArray::new(32);
+    /// ```
     pub fn new(size: usize) -> Self {
         ConcurrentArray {
             inner: Arc::new(SwmrCell::new(Inner::new(size))),
@@ -109,6 +167,8 @@ impl<T> Inner<T> {
 
             if headcount >= readers {
                 return;
+            } else {
+                thread::yield_now();
             }
         }
     }
@@ -148,6 +208,8 @@ impl<T: Default + Clone> Inner<T> {
 //          Need to avoid deadlocking threads which are waiting for write access during a drop. This could be done with Result (try_write?)
 
 pub struct ReadGuard<'a, T> {
+
+    // todo: explore adding a `refresh` function to `ReadGuard`'s which refreshes state as if the read guard were dropped and then created again
     epoch: usize,
     inner: Ref<'a, Inner<T>>,
 }
