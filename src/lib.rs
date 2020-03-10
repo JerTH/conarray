@@ -1,20 +1,27 @@
 //! A lock free single-writer, many-reader concurrent array
-#![allow(dead_code)]
-
 mod swmr;
 
 use std::ptr;
+use std::mem;
+use std::alloc;
 use std::thread;
 use std::sync::{ Arc };
 use std::sync::atomic::{ AtomicPtr, AtomicI64, Ordering };
 use std::ops::{ Deref, DerefMut, Mul };
 use swmr::{ Ref, RefMut, SwmrCell };
 
-/// A contiguous, heap allocated, fixed sized, concurrent array which supports a single writer and multiple readers in lock-free mode,
-/// and multiple writers which share a single lock. Reads are always wait-free
+/// A contiguous, heap allocated, fixed sized, concurrent array which supports a *single writer and multiple readers* in lock-free mode,
+/// and multiple writers which share a single lock. Reads are always wait-free, while writes may lock.
 /// 
 /// # Reading threads vs. Writing threads
-/// ...
+/// 
+/// Any thread which holds an instance of the same `ConcurrentArray` can function as either a reader or a writer or both. The only
+/// differentiating factor between reading threads and writing threads are the functions each thread calls. Functions which are guaranteed
+/// to be "read-safe" so to speak, meaning that they never invoke a write lock, are marked as such. Any other function is assumed to lock
+/// writes on the `ConcurrentArray`, blocking calls from any thread on functions which *are not* marked as "read-safe".
+/// 
+/// Read-safe functions are *guaranteed* to be wait free, while all other functions are guaranteed to be lock free *only if there is a
+/// single writing thread.* 
 #[derive(Debug)]
 pub struct ConcurrentArray<T> {
     inner: Arc<SwmrCell<Inner<T>>>,
@@ -43,7 +50,8 @@ impl<T> ConcurrentArray<T> {
         ReadGuard::from(self)
     }
     
-    /// Locks this `ConcurrentArray` with single writer write access, blocking the current thread until it can be acquired
+    /// Locks this `ConcurrentArray` with single writer write access, blocking the current thread until it can be acquired, but does
+    /// *not* block other threads from acquiring read access.
     /// 
     /// This function will not return while any other thread is performing any type of write operation on this `ConcurrentArray`,
     /// this includes any thread which calls any function which requires *mutable* access to the `ConcurrentArray`.
@@ -65,14 +73,35 @@ impl<T> ConcurrentArray<T> {
     /// 
     /// guard.iter_mut().for_each(|item| assert_eq!(*item, i32::default()));
     /// ```
-    pub fn write(&mut self) -> WriteGuard<T> {
+    pub fn write(&self) -> WriteGuard<T> {
         WriteGuard::from(self)
     }
     
     /// Commits a set of pending writes, atomically making them visible to any *new* read operation
     /// 
-    /// Any threads which were already reading during a call to `commit` will continue to see the old data as if it were 
-    pub fn commit(&mut self) {
+    /// Any threads which were already reading during a call to `commit` will continue to see the old data as if the commit never
+    /// happened.
+    /// A call to `commit` is guaranteed to be lock-free *only* if there is at most a single thread with *mutable* access to
+    /// the `ConcurrentArray`. Calling commit will cause the current thread to wait until any read operations which started before
+    /// the call are completed (by dropping their respective `ReadGuard`'s)
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use conarray::ConcurrentArray;
+    /// 
+    /// let mut array: ConcurrentArray<i32> = ConcurrentArray::new(10);
+    /// 
+    /// array.write().iter_mut().enumerate().for_each(|(i, item)| *item = (i as i32) - 5);
+    /// 
+    /// // we've mutated data, but haven't committed it
+    /// array.read().iter().enumerate().for_each(|(i, item)| assert_eq!(*item, i32::default()));
+    /// 
+    /// // all of our mutated data is immediately and atomically made visible here
+    /// array.commit();
+    /// array.read().iter().enumerate().for_each(|(i, item)| assert_eq!(*item, (i as i32) - 5));
+    /// 
+    pub fn commit(&self) {
         let mut inner: RefMut<Inner<T>> = unsafe { self.inner.borrow_mut() };
         
         inner.swap();
@@ -80,7 +109,31 @@ impl<T> ConcurrentArray<T> {
         inner.sync();
     }
 
-    pub fn cancel(&mut self) {
+    /// Cancels all pending written data and resets it to its original state
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use conarray::ConcurrentArray;
+    /// 
+    /// let mut array: ConcurrentArray<i32> = ConcurrentArray::new(10);
+    /// array.read().iter().enumerate().for_each(|(i, item)| assert_eq!(*item, i32::default()));
+    /// array.write().iter_mut().enumerate().for_each(|(i, item)| *item = (i as i32) - 5);
+    /// 
+    /// // reading the written data again should yield what we wrote
+    /// array.write().iter_mut().enumerate().for_each(|(i, item)| assert_eq!(*item, (i as i32) - 5));
+    /// 
+    /// // even though we wrote data, it hasn't been committed
+    /// array.read().iter().enumerate().for_each(|(i, item)| assert_eq!(*item, i32::default()));
+    /// 
+    /// // cancel everything we wrote, this resets the state of written data to reflect the readable data
+    /// array.cancel();
+    /// 
+    /// // read and write are now the same
+    /// array.read().iter().enumerate().for_each(|(i, item)| assert_eq!(*item, i32::default()));
+    /// array.write().iter_mut().enumerate().for_each(|(i, item)| assert_eq!(*item, i32::default()));
+    /// ```
+    pub fn cancel(&self) {
         let mut inner: RefMut<Inner<T>> = unsafe { self.inner.borrow_mut() };
         inner.sync();
     }
@@ -172,7 +225,7 @@ impl<T> Inner<T> {
             }
         }
     }
-
+    
     pub fn sync(&mut self) {
         let reader_ptr: *mut T = self.reader_ptr.load(Ordering::SeqCst);
         let writer_ptr: *mut T = self.writer_ptr.load(Ordering::SeqCst);
@@ -203,13 +256,22 @@ impl<T: Default + Clone> Inner<T> {
     }
 }
 
-// Note: Must ensure that only side of the bslice gets dropped when Inner is dropped, we don't want to drop both the read and write side.
-//          Probably want to drop the read side and simply free the write side, since the read side is considered authoritative state
-//          Need to avoid deadlocking threads which are waiting for write access during a drop. This could be done with Result (try_write?)
+impl<T> Drop for Inner<T> {
+    fn drop(&mut self) {
+        // Ensure we only drop objects stored in the READ side, and simply dealloc objects in the WRITE side. We consider the read side authoritative
+        let ptr: *mut T = self.reader_ptr.load(Ordering::SeqCst);
+        let slice: &mut [T] = unsafe { std::slice::from_raw_parts_mut(ptr, self.length) };
+
+        for item in slice {
+            unsafe { ptr::drop_in_place(item) };
+        }
+        
+        let ptr: *mut [T] = Box::into_raw(mem::take(&mut self.bslice));
+        unsafe { alloc::dealloc(ptr as *mut u8, alloc::Layout::new::<T>()) };
+    }
+}
 
 pub struct ReadGuard<'a, T> {
-
-    // todo: explore adding a `refresh` function to `ReadGuard`'s which refreshes state as if the read guard were dropped and then created again
     epoch: usize,
     inner: Ref<'a, Inner<T>>,
 }
@@ -246,8 +308,8 @@ pub struct WriteGuard<'a, T> {
     inner: RefMut<'a, Inner<T>>,
 }
 
-impl<'a, T> From<&'a mut ConcurrentArray<T>> for WriteGuard<'a, T> {
-    fn from(array: &'a mut ConcurrentArray<T>) -> Self {
+impl<'a, T> From<&'a ConcurrentArray<T>> for WriteGuard<'a, T> {
+    fn from(array: &'a ConcurrentArray<T>) -> Self {
         let inner: RefMut<'a, Inner<T>> = unsafe { array.inner.borrow_mut() };
 
         WriteGuard { inner }
@@ -273,6 +335,7 @@ impl<'a, T> DerefMut for WriteGuard<'a, T> {
 }
 
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,7 +346,7 @@ mod tests {
     const WRITTEN_VALUE: TT = 0x5BBDF7EF; // (0b01011011101111011111011111101111)
 
     fn init_array(s: usize, v: TT) -> ConcurrentArray<TT> {
-        let mut array: ConcurrentArray<TT> = ConcurrentArray::new(s);
+        let array: ConcurrentArray<TT> = ConcurrentArray::new(s);
 
         for value in array.write().iter_mut() {
             *value = v;
@@ -382,7 +445,7 @@ mod tests {
             }
         }
 
-        // Directly write into the read section, check each section, then sync, then assert all data in both sections is updated
+        // Directly write into the read section, check each section, then sync, then assert all data in both sections is the same
         {   
             let mut inner: RefMut<Inner<u32>> = unsafe { array.inner.borrow_mut() };
             for value in unsafe { std::slice::from_raw_parts_mut(inner.reader_ptr.load(Ordering::SeqCst), inner.length) } {
@@ -407,12 +470,13 @@ mod tests {
 }
 
 
-// today's goal: more unit tests, begin integration testing
-// today's stretch goal: implement basic iterators
-
 // Notes for future development
 //
 // 1. When a commit is made the read block does not have to be immediately copied onto the write block if it would be inefficient to do so
 //      rather we can simply *mark* the array has needing to be synchronized, and this synchronization can happen at any time before any new
 //      write operations occur. It can even happen through the action of some other thread that's busy waiting on the same structure
-
+// 
+// 2. What happens when one item in the structure points to another item in the structure? Probably should rely on indices instead of pointers
+//      Pointers shouldn't be acceptable or considered stable, similar to Vec
+//
+// 3. Explore adding a `refresh` function to `ReadGuard` which refreshes state as if the read guard were dropped and then created again

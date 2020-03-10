@@ -1,3 +1,4 @@
+//! A Single-Writer Multiple-Reader mutable memory location
 #![allow(dead_code)]
 
 use std::thread;
@@ -10,7 +11,8 @@ use std::cell::UnsafeCell;
 /// Additional mutable borrows force a wait condition on the additional borrowing thread(s). Lock-free behavior is guaranteed as long as only one thread
 /// ever writes, but locking may occur with multiple writing threads. All reads are guaranteed to be wait-free.
 ///
-/// Because `SwmrCell` breaks Rusts aliasing rules by design it is inherently unsafe and is not suitable for use just anywhere
+/// Because `SwmrCell` breaks Rusts aliasing rules by design it is inherently unsafe and is not suitable for use just anywhere. It is intended to be
+/// wrapped by safe code which can correctly leverage this property. As such `borrow_mut` is marked unsafe
 #[derive(Debug)]
 pub struct SwmrCell<T> {
     writing: AtomicBool,
@@ -59,7 +61,7 @@ impl <T: ?Sized> DerefMut for RefMut<'_, T> {
 impl<'b, T> RefMut<'b, T> {
     fn new(value: &'b mut T, writing: &'b AtomicBool) -> RefMut<'b, T> {
         while writing.compare_and_swap(false, true, Ordering::Acquire) {
-            thread::yield_now(); // todo: explore different spinning and yield techniques to optimize performance
+            thread::yield_now(); // todo: explore different spinning and yield techniques
         }
 
         RefMut {
@@ -85,7 +87,6 @@ impl<T> SwmrCell<T> {
     
     /// Retrieve an immutable reference to the contents of this `SwmrCell`
     pub fn borrow(&self) -> Ref<T> {
-        // We don't actually keep track of immutable references, but still wrap them in a `Ref`
         Ref {
             value: unsafe { &*self.value.get() }
         }
@@ -96,9 +97,11 @@ impl<T> SwmrCell<T> {
     /// Blocks while there is already an active mutable borrow, guaranteeing that there can only ever be one mutable borrow at any given time
     /// 
     /// # Safety
+    /// 
     /// `SwmrCell` allows one mutable borrow concurrently with any number of immutable borrows, breaking Rusts aliasing rules. This is inherently
-    /// unsafe, and special care must be taken by the user to properly synchronize access reads and writes over the stored data. `SwmrCell`'s are intended
-    /// as a building block for implementing more complex synchronization mechanisms
+    /// unsafe, and special care must be taken by the user to properly synchronize reads and writes on the stored data. `SwmrCell` is intended
+    /// as a building block for implementing more complex concurrency mechanisms, this *WILL* cause data races if some form of synchonization
+    /// mechanism is not implemented around it
     pub unsafe fn borrow_mut(&self) -> RefMut<T> {
         RefMut::new(&mut *self.value.get(), &self.writing)        
     }
@@ -106,8 +109,6 @@ impl<T> SwmrCell<T> {
 
 #[cfg(test)]
 mod tests {
-    // Note: Stress tests can only confirm the presence of a concurrent bugs - they can not confirm the absence of them
-    
     use super::*;
     use std::sync::{ Arc, atomic::{ AtomicU64, Ordering } };
     
