@@ -1,5 +1,4 @@
 //! A Single-Writer Multiple-Reader mutable memory location
-#![allow(dead_code)]
 
 use std::thread;
 use std::sync::atomic::{ AtomicBool, Ordering };
@@ -19,6 +18,7 @@ pub struct SwmrCell<T> {
     value: UnsafeCell<T>,
 }
 
+/// todo: Add constraints to these, likely incorrect for non-zst's
 unsafe impl<T> Send for SwmrCell<T> {}
 unsafe impl<T> Sync for SwmrCell<T> {}
 

@@ -1,5 +1,4 @@
 //! A lock free single-writer, many-reader concurrent array
-mod swmr;
 
 use std::ptr;
 use std::mem;
@@ -10,8 +9,13 @@ use std::sync::atomic::{ AtomicPtr, AtomicI64, Ordering };
 use std::ops::{ Deref, DerefMut, Mul };
 use swmr::{ Ref, RefMut, SwmrCell };
 
+mod swmr;
+
 /// A contiguous, heap allocated, fixed sized, concurrent array which supports a *single writer and multiple readers* in lock-free mode,
 /// and multiple writers which share a single lock. Reads are always wait-free, while writes may lock.
+/// 
+/// Due to the way `ConcurrentArray` necessarily handles concurrent reads and writes, it is limited to storing trivially copyable types
+/// or types which implement `Copy`. This may make it unsuitable for certain use cases
 /// 
 /// # Reading threads vs. Writing threads
 /// 
@@ -23,12 +27,12 @@ use swmr::{ Ref, RefMut, SwmrCell };
 /// Read-safe functions are *guaranteed* to be wait free, while all other functions are guaranteed to be lock free *only if there is a
 /// single writing thread.* 
 #[derive(Debug)]
-pub struct ConcurrentArray<T> {
+pub struct ConcurrentArray<T: Copy> {
     inner: Arc<SwmrCell<Inner<T>>>,
     epoch: usize,
 }
 
-impl<T> ConcurrentArray<T> {
+impl<T: Copy> ConcurrentArray<T> {
     /// Returns a `ReadGuard` which provides read access over the `ConcurrentArray`
     /// 
     /// Creating a read guard is guaranteed to be wait-free. Any attempts by writing threads to commit new writes to
@@ -76,7 +80,7 @@ impl<T> ConcurrentArray<T> {
     pub fn write(&self) -> WriteGuard<T> {
         WriteGuard::from(self)
     }
-    
+
     /// Commits a set of pending writes, atomically making them visible to any *new* read operation
     /// 
     /// Any threads which were already reading during a call to `commit` will continue to see the old data as if the commit never
@@ -143,7 +147,7 @@ impl<T> ConcurrentArray<T> {
     }
 }
 
-impl<T: Default + Clone> ConcurrentArray<T> {
+impl<T: Default + Copy> ConcurrentArray<T> {
     /// Creates an empty `ConcurrentArray` of size `size`
     /// 
     /// The array is immediately allocated on the heap and filled with `T::Default`
@@ -162,7 +166,7 @@ impl<T: Default + Clone> ConcurrentArray<T> {
     }
 }
 
-impl<T> Clone for ConcurrentArray<T> {
+impl<T: Copy> Clone for ConcurrentArray<T> {
     fn clone(&self) -> Self {
         let mut inner: RefMut<Inner<T>> = unsafe { self.inner.borrow_mut() };
         let mut epoch: usize = inner.epochs.len();
@@ -181,7 +185,7 @@ impl<T> Clone for ConcurrentArray<T> {
     }
 }
 
-impl<T> Drop for ConcurrentArray<T> {
+impl<T: Copy> Drop for ConcurrentArray<T> {
     fn drop(&mut self) {
         unsafe { self.inner.borrow_mut().fepoch.push(self.epoch) };
     }
@@ -225,7 +229,7 @@ impl<T> Inner<T> {
             }
         }
     }
-    
+
     pub fn sync(&mut self) {
         let reader_ptr: *mut T = self.reader_ptr.load(Ordering::SeqCst);
         let writer_ptr: *mut T = self.writer_ptr.load(Ordering::SeqCst);
@@ -256,27 +260,29 @@ impl<T: Default + Clone> Inner<T> {
     }
 }
 
-impl<T> Drop for Inner<T> {
-    fn drop(&mut self) {
-        // Ensure we only drop objects stored in the READ side, and simply dealloc objects in the WRITE side. We consider the read side authoritative
-        let ptr: *mut T = self.reader_ptr.load(Ordering::SeqCst);
-        let slice: &mut [T] = unsafe { std::slice::from_raw_parts_mut(ptr, self.length) };
+//impl<T> Drop for Inner<T> {
+//    fn drop(&mut self) {
+//        let ptr: *mut T = self.reader_ptr.load(Ordering::SeqCst);
+//        
+//        unsafe {
+//            let slice: &mut [T] = std::slice::from_raw_parts_mut(ptr, self.length);
+//            ptr::drop_in_place(slice)
+//        };
+//        
+//        let ptr: *mut [T] = Box::into_raw(mem::take(&mut self.bslice));
+//        unsafe { alloc::dealloc(ptr as *mut u8, alloc::Layout::new::<T>()) };
+//    }
+//}
 
-        for item in slice {
-            unsafe { ptr::drop_in_place(item) };
-        }
-        
-        let ptr: *mut [T] = Box::into_raw(mem::take(&mut self.bslice));
-        unsafe { alloc::dealloc(ptr as *mut u8, alloc::Layout::new::<T>()) };
-    }
-}
-
+/// An RAII structure used to correctly synchronize concurrent read access of a `ConcurrentArray`.
+/// 
+/// Produced by the `read` method on `ConcurrentArray`.
 pub struct ReadGuard<'a, T> {
     epoch: usize,
     inner: Ref<'a, Inner<T>>,
 }
 
-impl<'a, T> From<&'a ConcurrentArray<T>> for ReadGuard<'a, T> {
+impl<'a, T: Copy> From<&'a ConcurrentArray<T>> for ReadGuard<'a, T> {
     fn from(array: &'a ConcurrentArray<T>) -> Self {
         array.increment_epoch();
 
@@ -303,12 +309,26 @@ impl<'a, T> Deref for ReadGuard<'a, T> {
     }
 }
 
+/// An RAII structure used to correctly synchronize concurrent write access of a `ConcurrentArray`.
+/// 
+/// Produced by the `write` method on `ConcurrentArray`.
 #[derive(Debug)]
 pub struct WriteGuard<'a, T> {
     inner: RefMut<'a, Inner<T>>,
 }
 
-impl<'a, T> From<&'a ConcurrentArray<T>> for WriteGuard<'a, T> {
+//impl<'a, T> WriteGuard<'a, T> {
+//    pub fn set(&mut self, idx: usize, value: T) {
+//        // todo: Change this so that the atomic pointer isn't read every time if it's not necessary
+//
+//        let ptr: *mut T = self.inner.writer_ptr.load(Ordering::SeqCst);
+//        let slice: &mut [T] = unsafe { std::slice::from_raw_parts_mut(ptr, self.inner.length) };
+//
+//        slice[idx] = value;
+//    }
+//}
+
+impl<'a, T: Copy> From<&'a ConcurrentArray<T>> for WriteGuard<'a, T> {
     fn from(array: &'a ConcurrentArray<T>) -> Self {
         let inner: RefMut<'a, Inner<T>> = unsafe { array.inner.borrow_mut() };
 
@@ -466,9 +486,8 @@ mod tests {
                 assert_eq!(*value, WRITTEN_VALUE);
             }
         }
-    }
+    }   
 }
-
 
 // Notes for future development
 //

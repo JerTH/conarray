@@ -71,6 +71,10 @@ macro_rules! swmr_contention_tests {
                 // This is the control thread
                 thread::sleep(Duration::from_millis(DURATION as u64));
                 stop.store(true, Ordering::SeqCst);
+
+                for handle in handles {
+                    let _ = handle.join();
+                }
             }
         )*
     };
